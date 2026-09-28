@@ -76,6 +76,11 @@ struct SolverParams {
 	u32 tailtpb = 0;
 	u32 recoverblocks = 0;
 	u32 recovertpb = 0;
+
+	// [tari-c29] Runtime per-arch overrides for the compile-time-pinned round
+	// TPBs (round 1, rounds 2-3). 0 = keep the build defaults.
+	u32 trimtpb_r1 = 0;
+	u32 trimtpb_r23 = 0;
 };
 
 // Solutions result structs to be instantiated by caller,

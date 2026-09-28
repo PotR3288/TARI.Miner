@@ -593,6 +593,8 @@ struct Options {
     int tail_tpb = -1;
     int recover_blocks = -1;
     int recover_tpb = -1;
+    int trim_tpb_r1 = -1;
+    int trim_tpb_r23 = -1;
 };
 
 static std::string default_worker() {
@@ -627,7 +629,9 @@ static void usage() {
            "  --trim-tpb N            trim rounds threads/block, default 320\n"
            "  --tail-tpb N            tail threads/block, default 1024\n"
            "  --recover-blocks N      recovery blocks, default 1024 bounded by graph size\n"
-           "  --recover-tpb N         recovery threads/block, default 1024\n");
+           "  --recover-tpb N         recovery threads/block, default 1024\n"
+           "  --trim-tpb-r1 N         round-1 trim threads/block, per-GPU auto default\n"
+           "  --trim-tpb-r23 N        rounds 2-3 trim threads/block, per-GPU auto default\n");
 }
 
 static bool parse_args(int argc, char **argv, Options &o) {
@@ -656,6 +660,8 @@ static bool parse_args(int argc, char **argv, Options &o) {
         else if (!strcmp(argv[i], "--tail-tpb")) { char *v = need(argv[i]); if (!v) return false; o.tail_tpb = atoi(v); }
         else if (!strcmp(argv[i], "--recover-blocks")) { char *v = need(argv[i]); if (!v) return false; o.recover_blocks = atoi(v); }
         else if (!strcmp(argv[i], "--recover-tpb")) { char *v = need(argv[i]); if (!v) return false; o.recover_tpb = atoi(v); }
+        else if (!strcmp(argv[i], "--trim-tpb-r1")) { char *v = need(argv[i]); if (!v) return false; o.trim_tpb_r1 = atoi(v); }
+        else if (!strcmp(argv[i], "--trim-tpb-r23")) { char *v = need(argv[i]); if (!v) return false; o.trim_tpb_r23 = atoi(v); }
         else if (!strcmp(argv[i], "--version")) { printf("TARI.Miner C29 %s\n", TARI_MINER_VERSION); exit(0); }
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(); exit(0); }
         else {
@@ -741,6 +747,14 @@ int main(int argc, char **argv) {
     fill_default_params(&params);
     params.device = opt.device;
     params.mutate_nonce = false;
+#if !TARI_C29_REFERENCE_BUILD
+    // Runtime per-arch tuning (see tari_miner_pipeline.h). Explicit CLI
+    // overrides below still win over the table.
+    const tari_miner::ArchTuning arch = tari_miner::arch_tuning(prop.major, prop.minor);
+    if (arch.ntrims > 0) params.ntrims = (uint16_t)arch.ntrims;
+    if (arch.trim_tpb_r1 > 0) params.trimtpb_r1 = (uint16_t)arch.trim_tpb_r1;
+    if (arch.trim_tpb_r23 > 0) params.trimtpb_r23 = (uint16_t)arch.trim_tpb_r23;
+#endif
     if (opt.ntrims > 0) params.ntrims = opt.ntrims & -2;
     if (opt.gena_blocks > 0) params.genablocks = opt.gena_blocks;
     if (opt.gena_tpb > 0) params.genatpb = opt.gena_tpb;
@@ -749,6 +763,8 @@ int main(int argc, char **argv) {
     if (opt.tail_tpb > 0) params.tailtpb = opt.tail_tpb;
     if (opt.recover_blocks > 0) params.recoverblocks = opt.recover_blocks;
     if (opt.recover_tpb > 0) params.recovertpb = opt.recover_tpb;
+    if (opt.trim_tpb_r1 > 0) params.trimtpb_r1 = opt.trim_tpb_r1;
+    if (opt.trim_tpb_r23 > 0) params.trimtpb_r23 = opt.trim_tpb_r23;
     std::vector<SolverCtx*> contexts;
     SolverCtx *ctx = create_solver_ctx(&params);
     if (!ctx || !ctx->trimmer.initsuccess) {

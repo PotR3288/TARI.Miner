@@ -262,6 +262,33 @@ measurements are a separate performance check and do not replace the exact
 recall gate. Hosted CI compiles both profiles and exercises the verifier
 fixtures; the full sequence runs only on a trusted host with the matching GPU.
 
+### Trim tuning
+
+The miner selects trim parameters at runtime from the detected GPU compute
+capability (`tari_miner::arch_tuning` in `tari_miner_pipeline.h`). Only
+architectures with benchmarked values deviate from the reference profile; all
+others keep it, so a single binary is safe on any supported card. Explicit CLI
+flags always win over the table:
+
+```text
+--ntrims N            trim rounds (even)
+--trim-tpb-r1 N       round 1 threads/block
+--trim-tpb-r23 N      rounds 2-3 threads/block
+--gena-blocks/--gena-tpb/--genb-tpb/--trim-tpb/--tail-tpb/--recover-*
+```
+
+To benchmark a new GPU model, run the sweep harness on that card and record the
+best row in `arch_tuning`:
+
+```bash
+tests/tune_sweep.sh bin/tari_c29_solver_sm_86 --count 3000 \
+    --ntrims 44,46,48,50 --r1 768,960,1024 --r23 768,960,1024
+```
+
+It prints a ranked table and CSV; rows with `verify failures > 0` are marked
+INVALID and must be discarded. After changing the table for an architecture,
+re-run the exact GPU recall regression above before shipping.
+
 ## Build From Source
 
 The repository includes its required third-party source under

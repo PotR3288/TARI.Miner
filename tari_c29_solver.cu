@@ -131,6 +131,7 @@ int main(int argc, char **argv) {
     int ntrims_override = 0;
     int gena_blocks = -1, gena_tpb = -1, genb_tpb = -1;
     int trim_tpb = -1, tail_tpb = -1, recover_blocks = -1, recover_tpb = -1;
+    int trim_tpb_r1 = -1, trim_tpb_r23 = -1;
     uint8_t mining_hash[32];
     for (int i = 0; i < 32; i++) mining_hash[i] = (uint8_t)i;  // deterministic default
 
@@ -149,6 +150,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--tail-tpb") && i + 1 < argc) tail_tpb = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--recover-blocks") && i + 1 < argc) recover_blocks = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--recover-tpb") && i + 1 < argc) recover_tpb = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--trim-tpb-r1") && i + 1 < argc) trim_tpb_r1 = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--trim-tpb-r23") && i + 1 < argc) trim_tpb_r23 = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--mining-hash") && i + 1 < argc) {
             if (parse_hex32(argv[++i], mining_hash) != 0) {
                 fprintf(stderr, "bad --mining-hash (need 64 hex chars)\n"); return 2;
@@ -162,6 +165,7 @@ int main(int argc, char **argv) {
                    "[--recall-jsonl FILE] "
                    "[--gena-blocks N] [--gena-tpb N] [--genb-tpb N] "
                    "[--trim-tpb N] [--tail-tpb N] [--recover-blocks N] [--recover-tpb N] "
+                   "[--trim-tpb-r1 N] [--trim-tpb-r23 N] "
                    "[--version]\n");
             return 0;
         } else {
@@ -208,6 +212,14 @@ int main(int argc, char **argv) {
 #if SOLVER_CPULOAD
     params.cpuload = true;
 #endif
+#if !TARI_C29_REFERENCE_BUILD
+    // Runtime per-arch tuning: the reference profile stays bit-exact with the
+    // upstream defaults so validation runs are comparable.
+    const tari_miner::ArchTuning arch = tari_miner::arch_tuning(prop.major, prop.minor);
+    if (arch.ntrims > 0) params.ntrims = (uint16_t)arch.ntrims;
+    if (arch.trim_tpb_r1 > 0) params.trimtpb_r1 = (uint16_t)arch.trim_tpb_r1;
+    if (arch.trim_tpb_r23 > 0) params.trimtpb_r23 = (uint16_t)arch.trim_tpb_r23;
+#endif
     if (ntrims_override > 0) params.ntrims = (uint16_t)ntrims_override;
     if (gena_blocks > 0) params.genablocks = (uint16_t)gena_blocks;
     if (gena_tpb > 0) params.genatpb = (uint16_t)gena_tpb;
@@ -216,6 +228,8 @@ int main(int argc, char **argv) {
     if (tail_tpb > 0) params.tailtpb = (uint16_t)tail_tpb;
     if (recover_blocks > 0) params.recoverblocks = (uint16_t)recover_blocks;
     if (recover_tpb > 0) params.recovertpb = (uint16_t)recover_tpb;
+    if (trim_tpb_r1 > 0) params.trimtpb_r1 = (uint16_t)trim_tpb_r1;
+    if (trim_tpb_r23 > 0) params.trimtpb_r23 = (uint16_t)trim_tpb_r23;
     SolverCtx *ctx = create_solver_ctx(&params);
     if (!ctx || !ctx->trimmer.initsuccess) {
         fprintf(stderr, "failed to init solver (need ~6GB VRAM). reason: %s\n", LAST_ERROR_REASON);

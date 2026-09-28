@@ -4,6 +4,35 @@
 
 namespace tari_miner {
 
+// Runtime per-architecture trim tuning. The build scripts used to bake the
+// sm_120 tuning into compile flags; these tables let one binary select a
+// tuned parameter set at runtime from the detected compute capability, with
+// explicit CLI overrides still winning over both. Only architectures with
+// benchmarked values deviate from the reference profile — run
+// tests/tune_sweep.sh on each GPU generation and add entries here when
+// measurements justify it. Late-round TPB is already runtime via
+// trimparams::trim.tpb; only the compile-time-pinned rounds need entries.
+struct ArchTuning {
+    int ntrims = 0;        // 0 = keep the compiled default (TARI_C29_DEFAULT_NTRIMS)
+    int trim_tpb_r1 = 0;   // threads/block for round 1, 0 = keep build default
+    int trim_tpb_r23 = 0;  // threads/block for rounds 2-3, 0 = keep build default
+};
+
+inline ArchTuning arch_tuning(int major, int minor) {
+    ArchTuning t;
+    const int cc = major * 10 + minor;
+    if (cc >= 120) {
+        // Blackwell: the tuning set previously baked into build flags.
+        t.ntrims = 48;
+        t.trim_tpb_r1 = 1024;
+        t.trim_tpb_r23 = 960;
+    } else if (cc >= 86) {
+        // Ampere/Ada: keep the reference profile for now. Fill these in from
+        // tests/tune_sweep.sh results per GPU model before shipping a change.
+    }
+    return t;
+}
+
 enum class DriverMode {
     Linux,
     WindowsWddm,

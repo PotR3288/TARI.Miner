@@ -780,6 +780,10 @@ struct trimparams {
   blockstpb trim;
   blockstpb tail;
   blockstpb recover;
+  // Runtime per-arch overrides for the compile-time-pinned round TPBs.
+  // 0 = fall back to the ROUND1_TPB / ROUND23_TPB build defaults.
+  u16 trim_tpb_r1 = 0;
+  u16 trim_tpb_r23 = 0;
 
   trimparams() {
     ntrims              = TARI_C29_DEFAULT_NTRIMS;
@@ -938,21 +942,21 @@ struct edgetrimmer {
     TARI_TIMING_BEGIN();
     cudaMemset(indexesE[0], 0, indexesSize);
 
-    Round<NB, EDGES_B/NB, EDGES_B/2, 1, !SKIP_LATE_NULL_CHECKS><<<tp.trim.blocks, ROUND1_TPB ? ROUND1_TPB : tp.trim.tpb>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]); // to .296
+    Round<NB, EDGES_B/NB, EDGES_B/2, 1, !SKIP_LATE_NULL_CHECKS><<<tp.trim.blocks, tp.trim_tpb_r1 ? tp.trim_tpb_r1 : (ROUND1_TPB ? ROUND1_TPB : tp.trim.tpb)>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]); // to .296
     if (abort) return false;
     TARI_TIMING_END(timingRound1);
 
     TARI_TIMING_BEGIN();
     cudaMemset(indexesE[1], 0, indexesSize);
 
-    Round<1, EDGES_B/2, EDGES_A/4, 0, !SKIP_LATE_NULL_CHECKS><<<tp.trim.blocks, ROUND23_TPB ? ROUND23_TPB : tp.trim.tpb>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]); // to .176
+    Round<1, EDGES_B/2, EDGES_A/4, 0, !SKIP_LATE_NULL_CHECKS><<<tp.trim.blocks, tp.trim_tpb_r23 ? tp.trim_tpb_r23 : (ROUND23_TPB ? ROUND23_TPB : tp.trim.tpb)>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]); // to .176
     if (abort) return false;
     TARI_TIMING_END(timingRound2);
 
     TARI_TIMING_BEGIN();
     cudaMemset(indexesE[0], 0, indexesSize);
 
-    Round<1, EDGES_A/4, EDGES_B/4, 1, !SKIP_LATE_NULL_CHECKS><<<tp.trim.blocks, ROUND23_TPB ? ROUND23_TPB : tp.trim.tpb>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]); // to .117
+    Round<1, EDGES_A/4, EDGES_B/4, 1, !SKIP_LATE_NULL_CHECKS><<<tp.trim.blocks, tp.trim_tpb_r23 ? tp.trim_tpb_r23 : (ROUND23_TPB ? ROUND23_TPB : tp.trim.tpb)>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]); // to .117
     if (abort) return false;
     TARI_TIMING_END(timingRound3);
 
@@ -1359,6 +1363,8 @@ CALL_CONVENTION SolverCtx* create_solver_ctx(SolverParams* params) {
   tp.tail.tpb = params->tailtpb;
   tp.recover.blocks = params->recoverblocks;
   tp.recover.tpb = params->recovertpb;
+  tp.trim_tpb_r1 = (u16)params->trimtpb_r1;
+  tp.trim_tpb_r23 = (u16)params->trimtpb_r23;
 
   cudaDeviceProp prop;
   checkCudaErrors_N(cudaGetDeviceProperties(&prop, params->device));
@@ -1366,6 +1372,10 @@ CALL_CONVENTION SolverCtx* create_solver_ctx(SolverParams* params) {
   assert(tp.genA.tpb <= prop.maxThreadsPerBlock);
   assert(tp.genB.tpb <= prop.maxThreadsPerBlock);
   assert(tp.trim.tpb <= prop.maxThreadsPerBlock);
+  if (tp.trim_tpb_r1)
+    assert(tp.trim_tpb_r1 <= prop.maxThreadsPerBlock);
+  if (tp.trim_tpb_r23)
+    assert(tp.trim_tpb_r23 <= prop.maxThreadsPerBlock);
   // assert(tp.tailblocks <= prop.threadDims[0]);
   assert(tp.tail.tpb <= prop.maxThreadsPerBlock);
   assert(tp.recover.tpb <= prop.maxThreadsPerBlock);
