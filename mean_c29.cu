@@ -1090,6 +1090,11 @@ struct solver_ctx {
   }
 
   int findcycles_with_keys(uint2 *edges, u32 nedges, const siphash_keys &keys, std::vector<u32> &outSols) {
+    // [tari-c29] Upper-bound experiment: skip the host walk entirely to measure
+    // how much of the current rate is CPU-walk-limited vs GPU-trim-limited.
+    static const bool skip_walk = getenv("TARI_C29_SKIP_WALK") != nullptr;
+    if (skip_walk)
+      return 0;
     // [tari-c29] Host-walk timing: TARI_C29_WALK_TIMING=1 logs per-attempt
     // graph-construction cost (the candidate for on-GPU cycle-finding).
     static const bool walk_timing = getenv("TARI_C29_WALK_TIMING") != nullptr;
