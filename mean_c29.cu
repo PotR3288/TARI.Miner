@@ -765,7 +765,7 @@ __global__ void RecoveryBatch(const siphash_keys sipkeys, ulonglong4 *buffer,
       u32 u = edge & EDGEMASK;
       u32 v = (edge >> 32) & EDGEMASK;
       for (int c = 0; c < ncands; c++) { //YO
-        const uint2 *ce = candEdges + c * PROOFSIZE;
+        const uint2 *ce = &candEdges[c][0];
         for (int p = 0; p < PROOFSIZE; p++) {
           if (ce[p].x == u && ce[p].y == v) {
             nonces[c][p] = nonce0 + i + 1; // +1: keep nonce 0 distinguishable from "no match"
