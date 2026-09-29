@@ -742,11 +742,13 @@ inline int gpuAssert(cudaError_t code, const char *file, int line, bool abort=tr
 // pre-filled with NONCE_UNRESOLVED; resolved positions store nonce+1 so that a
 // genuine edge with nonce 0 is distinguishable from an unresolved position.
 #define RECOVERY_NONCE_UNRESOLVED 0xFFFFFFFFu
-// candEdges is passed BY VALUE (MAXSOLS*PROOFSIZE uint2 = 1344B < 4KB kernel
-// param limit) — no per-candidate H2D copy. Declaring it as a pointer would
-// pass the host address into device space and crash on first dereference.
+// Candidate edges travel BY VALUE inside this struct (1344B; total param
+// space ~1.4KB < 4KB limit). A bare array parameter would decay to a host
+// pointer and the kernel would dereference it in device address space —
+// structs are copied into kernel param space, arrays are not.
+struct RecoveryCandEdges { uint2 e[MAXSOLS][PROOFSIZE]; };
 __global__ void RecoveryBatch(const siphash_keys sipkeys, ulonglong4 *buffer,
-                              const uint2 candEdges[MAXSOLS][PROOFSIZE], int ncands, u32 *noncesOut) {
+                              const RecoveryCandEdges cand, int ncands, u32 *noncesOut) {
   const int gid = blockDim.x * blockIdx.x + threadIdx.x;
   const int lid = threadIdx.x;
   const int nthreads = blockDim.x * gridDim.x;
@@ -765,7 +767,7 @@ __global__ void RecoveryBatch(const siphash_keys sipkeys, ulonglong4 *buffer,
       u32 u = edge & EDGEMASK;
       u32 v = (edge >> 32) & EDGEMASK;
       for (int c = 0; c < ncands; c++) { //YO
-        const uint2 *ce = &candEdges[c][0];
+        const uint2 *ce = &cand.e[c][0];
         for (int p = 0; p < PROOFSIZE; p++) {
           if (ce[p].x == u && ce[p].y == v) {
             nonces[c][p] = nonce0 + i + 1; // +1: keep nonce 0 distinguishable from "no match"
@@ -1100,11 +1102,11 @@ struct solver_ctx {
     // redundant scans) with a host round-trip between each. Candidates that do
     // not fully resolve are dropped here; run_solver's verify() re-derives the
     // proof from nonces independently, so nothing half-resolved can leak out.
-    uint2 candEdges[MAXSOLS][PROOFSIZE];
+    RecoveryCandEdges cand; // passed BY VALUE — arrays decay to host pointers
     const int ncands = (int)(cg.nsols < MAXSOLS ? cg.nsols : MAXSOLS);
     for (u32 s = 0; s < (u32)ncands; s++) {
       for (u32 j = 0; j < PROOFSIZE; j++)
-        candEdges[s][j] = edges[cg.sols[s][j]];
+        cand.e[s][j] = edges[cg.sols[s][j]];
     }
 
 #if RECOVERY_SMALL_OUTPUT
@@ -1130,7 +1132,7 @@ struct solver_ctx {
     noncesOut = (u32 *)trimmer.indexesE[1];
 #endif
     if (rc == cudaSuccess) {
-      RecoveryBatch<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, candEdges, ncands, noncesOut);
+      RecoveryBatch<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, cand, ncands, noncesOut);
       rc = cudaGetLastError();
     }
     // Recovery uses the calling thread's default stream. Synchronizing that
