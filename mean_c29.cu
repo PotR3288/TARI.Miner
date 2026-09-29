@@ -742,8 +742,11 @@ inline int gpuAssert(cudaError_t code, const char *file, int line, bool abort=tr
 // pre-filled with NONCE_UNRESOLVED; resolved positions store nonce+1 so that a
 // genuine edge with nonce 0 is distinguishable from an unresolved position.
 #define RECOVERY_NONCE_UNRESOLVED 0xFFFFFFFFu
+// candEdges is passed BY VALUE (MAXSOLS*PROOFSIZE uint2 = 1344B < 4KB kernel
+// param limit) — no per-candidate H2D copy. Declaring it as a pointer would
+// pass the host address into device space and crash on first dereference.
 __global__ void RecoveryBatch(const siphash_keys sipkeys, ulonglong4 *buffer,
-                              const uint2 *candEdges, int ncands, u32 *noncesOut) {
+                              const uint2 candEdges[MAXSOLS][PROOFSIZE], int ncands, u32 *noncesOut) {
   const int gid = blockDim.x * blockIdx.x + threadIdx.x;
   const int lid = threadIdx.x;
   const int nthreads = blockDim.x * gridDim.x;
@@ -1127,7 +1130,7 @@ struct solver_ctx {
     noncesOut = (u32 *)trimmer.indexesE[1];
 #endif
     if (rc == cudaSuccess) {
-      RecoveryBatch<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, &candEdges[0][0], ncands, noncesOut);
+      RecoveryBatch<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, candEdges, ncands, noncesOut);
       rc = cudaGetLastError();
     }
     // Recovery uses the calling thread's default stream. Synchronizing that
