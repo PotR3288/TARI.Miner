@@ -289,6 +289,14 @@ It prints a ranked table and CSV; rows with `verify failures > 0` are marked
 INVALID and must be discarded. After changing the table for an architecture,
 re-run the exact GPU recall regression above before shipping.
 
+### Recovery (nonce resolution)
+
+When the host-side cycle finder reports candidate cycles, their edge nonces are
+resolved by a single batched full-graph scan (`RecoveryBatch` in `mean_c29.cu`)
+instead of one 2^EDGEBITS-edge scan per candidate. Candidates that do not fully
+resolve are dropped; `verify()` re-derives each proof from the recovered nonces
+independently, so nothing half-resolved can be submitted.
+
 ## Build From Source
 
 The repository includes its required third-party source under

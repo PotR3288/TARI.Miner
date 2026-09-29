@@ -161,7 +161,6 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 #define NA  ((NB * NEPS_A + NEPS_B-1) / NEPS_B)
 #endif
 
-__constant__ uint2 recoveredges[PROOFSIZE];
 __constant__ uint2 e0 = {0,0};
 
 __device__ u64 dipblock(const siphash_keys &keys, const word_t edge, u64 *buf) {
@@ -737,15 +736,23 @@ inline int gpuAssert(cudaError_t code, const char *file, int line, bool abort=tr
   return code;
 }
 
-__global__ void Recovery(const siphash_keys sipkeys, ulonglong4 *buffer, int *indexes) {
+// [tari-c29] Batched recovery: one full-graph scan resolves the nonces for
+// ALL candidate cycles at once, instead of launching a separate 2^EDGEBITS-edge
+// scan per candidate (up to MAXSOLS redundant scans). Output slots are
+// pre-filled with NONCE_UNRESOLVED; resolved positions store nonce+1 so that a
+// genuine edge with nonce 0 is distinguishable from an unresolved position.
+#define RECOVERY_NONCE_UNRESOLVED 0xFFFFFFFFu
+__global__ void RecoveryBatch(const siphash_keys sipkeys, ulonglong4 *buffer,
+                              const uint2 *candEdges, int ncands, u32 *noncesOut) {
   const int gid = blockDim.x * blockIdx.x + threadIdx.x;
   const int lid = threadIdx.x;
   const int nthreads = blockDim.x * gridDim.x;
   const int loops = NEDGES / nthreads;
-  __shared__ u32 nonces[PROOFSIZE];
+  __shared__ u32 nonces[MAXSOLS][PROOFSIZE];
   u64 buf[EDGE_BLOCK_SIZE];
-
-  if (lid < PROOFSIZE) nonces[lid] = 0;
+  for (int c = 0; c < MAXSOLS; c++) {
+    if (lid < PROOFSIZE) nonces[c][lid] = 0;
+  }
   __syncthreads();
   for (int blk = 0; blk < loops; blk += EDGE_BLOCK_SIZE) {
     u32 nonce0 = gid * loops + blk;
@@ -754,17 +761,24 @@ __global__ void Recovery(const siphash_keys sipkeys, ulonglong4 *buffer, int *in
       u64 edge = buf[i] ^ last;
       u32 u = edge & EDGEMASK;
       u32 v = (edge >> 32) & EDGEMASK;
-      for (int p = 0; p < PROOFSIZE; p++) { //YO
-        if (recoveredges[p].x == u && recoveredges[p].y == v) {
-          nonces[p] = nonce0 + i;
+      for (int c = 0; c < ncands; c++) { //YO
+        const uint2 *ce = candEdges + c * PROOFSIZE;
+        for (int p = 0; p < PROOFSIZE; p++) {
+          if (ce[p].x == u && ce[p].y == v) {
+            nonces[c][p] = nonce0 + i + 1; // +1: keep nonce 0 distinguishable from "no match"
+          }
         }
       }
     }
   }
   __syncthreads();
   if (lid < PROOFSIZE) {
-    if (nonces[lid] > 0)
-      indexes[lid] = nonces[lid];
+    // Only the block whose partition contains the matching edge has a nonzero
+    // value; zero-check keeps other blocks from clobbering it in global memory.
+    for (int c = 0; c < ncands; c++) {
+      if (nonces[c][lid] > 0)
+        noncesOut[c * PROOFSIZE + lid] = nonces[c][lid] - 1;
+    }
   }
 }
 
@@ -1026,7 +1040,6 @@ struct solver_ctx {
   uint2 *edges;
   bool pinned_edges;
   graph<word_t> cg;
-  uint2 soledges[PROOFSIZE];
   std::vector<u32> sols; // concatenation of all proof's indices
 #if RECOVERY_SMALL_OUTPUT
   u32 *recoverIndexes;
@@ -1074,50 +1087,82 @@ struct solver_ctx {
     cg.reset();
     for (u32 i = 0; i < nedges; i++)
       cg.add_compress_edge(edges[i].x, edges[i].y);
-    for (u32 s = 0 ;s < cg.nsols; s++) {
-      // print_log("Solution");
+    if (!cg.nsols)
+      return 0;
+
+    // [tari-c29] Batched recovery: collect every candidate cycle first, then
+    // resolve all of their nonces in a single full-graph scan. The old code
+    // launched one 2^EDGEBITS-edge Recovery pass per candidate (up to MAXSOLS
+    // redundant scans) with a host round-trip between each. Candidates that do
+    // not fully resolve are dropped here; run_solver's verify() re-derives the
+    // proof from nonces independently, so nothing half-resolved can leak out.
+    uint2 candEdges[MAXSOLS][PROOFSIZE];
+    const int ncands = (int)(cg.nsols < MAXSOLS ? cg.nsols : MAXSOLS);
+    for (u32 s = 0; s < (u32)ncands; s++) {
+      for (u32 j = 0; j < PROOFSIZE; j++)
+        candEdges[s][j] = edges[cg.sols[s][j]];
+    }
+
+#if RECOVERY_SMALL_OUTPUT
+    const size_t outBytes = (size_t)MAXSOLS * PROOFSIZE * sizeof(u32);
+#else
+    const size_t outBytes = (size_t)ncands * PROOFSIZE * sizeof(u32);
+#endif
+    cudaError_t rc = cudaSuccess; // sentinel fill below primes every output slot
+    {
+      u32 *fill = new u32[outBytes / sizeof(u32)];
+      for (size_t i = 0; i < outBytes / sizeof(u32); i++) fill[i] = RECOVERY_NONCE_UNRESOLVED;
+#if RECOVERY_SMALL_OUTPUT
+      rc = cudaMemcpy(recoverIndexes, fill, outBytes, cudaMemcpyHostToDevice);
+#else
+      rc = cudaMemcpy(trimmer.indexesE[1], fill, outBytes, cudaMemcpyHostToDevice);
+#endif
+      delete[] fill;
+    }
+    u32 *noncesOut;
+#if RECOVERY_SMALL_OUTPUT
+    noncesOut = recoverIndexes;
+#else
+    noncesOut = (u32 *)trimmer.indexesE[1];
+#endif
+    if (rc == cudaSuccess) {
+      RecoveryBatch<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, &candEdges[0][0], ncands, noncesOut);
+      rc = cudaGetLastError();
+    }
+    // Recovery uses the calling thread's default stream. Synchronizing that
+    // stream preserves overlap with trims running in other host threads.
+    if (rc == cudaSuccess)
+      rc = cudaStreamSynchronize(0);
+    if (rc != cudaSuccess)
+      return gpuAssert(rc, __FILE__, __LINE__);
+
+    u32 *noncesHost = new u32[(size_t)MAXSOLS * PROOFSIZE]; // always host-side, flat
+#if RECOVERY_SMALL_OUTPUT
+    rc = cudaMemcpy(noncesHost, recoverIndexes, outBytes, cudaMemcpyDeviceToHost);
+#else
+    rc = cudaMemcpy(noncesHost, trimmer.indexesE[1], outBytes, cudaMemcpyDeviceToHost);
+#endif
+    if (rc != cudaSuccess) {
+      delete[] noncesHost;
+      return gpuAssert(rc, __FILE__, __LINE__);
+    }
+
+    for (u32 s = 0; s < (u32)ncands; s++) {
+      bool complete = true;
       for (u32 j = 0; j < PROOFSIZE; j++) {
-        soledges[j] = edges[cg.sols[s][j]];
-        // print_log(" (%x, %x)", soledges[j].x, soledges[j].y);
+        if (noncesHost[s * PROOFSIZE + j] == RECOVERY_NONCE_UNRESOLVED) { // position never matched: not a real cycle
+          complete = false;
+          break;
+        }
       }
-      // print_log("\n");
-      // Recovery fills this slot. On failure it is removed again, so a caller
-      // never sees a half-written proof of zeros that would then be reported as
-      // a verification failure.
+      if (!complete)
+        continue;
       const size_t solbase = outSols.size();
       outSols.resize(solbase + PROOFSIZE);
-      cudaError_t rc = cudaMemcpyToSymbol(recoveredges, soledges, sizeof(soledges));
-#if RECOVERY_SMALL_OUTPUT
-      if (rc == cudaSuccess)
-        rc = cudaMemset(recoverIndexes, 0, PROOFSIZE * sizeof(u32));
-      if (rc == cudaSuccess) {
-        Recovery<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, (int *)recoverIndexes);
-        rc = cudaGetLastError();
-      }
-      if (rc == cudaSuccess)
-        rc = cudaMemcpy(&outSols[solbase], recoverIndexes,
-                        PROOFSIZE * sizeof(u32), cudaMemcpyDeviceToHost);
-#else
-      if (rc == cudaSuccess)
-        rc = cudaMemset(trimmer.indexesE[1], 0, trimmer.indexesSize);
-      if (rc == cudaSuccess) {
-        Recovery<<<trimmer.tp.recover.blocks, trimmer.tp.recover.tpb>>>(keys, (ulonglong4*)trimmer.bufferA, (int *)trimmer.indexesE[1]);
-        rc = cudaGetLastError();
-      }
-      if (rc == cudaSuccess)
-        rc = cudaMemcpy(&outSols[solbase], trimmer.indexesE[1],
-                        PROOFSIZE * sizeof(u32), cudaMemcpyDeviceToHost);
-#endif
-      // Recovery uses the calling thread's default stream. Synchronizing that
-      // stream preserves overlap with trims running in other host threads.
-      if (rc == cudaSuccess)
-        rc = cudaStreamSynchronize(0);
-      if (rc != cudaSuccess) {
-        outSols.resize(solbase);
-        return gpuAssert(rc, __FILE__, __LINE__);
-      }
+      memcpy(&outSols[solbase], &noncesHost[s * PROOFSIZE], PROOFSIZE * sizeof(u32));
       qsort(&outSols[solbase], PROOFSIZE, sizeof(u32), cg.nonce_cmp);
     }
+    delete[] noncesHost;
     return 0;
   }
 
