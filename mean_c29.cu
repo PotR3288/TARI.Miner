@@ -1062,7 +1062,8 @@ struct solver_ctx {
 #endif
 #if RECOVERY_SMALL_OUTPUT
     recoverIndexes = nullptr;
-    checkCudaErrors_V(cudaMalloc((void **)&recoverIndexes, PROOFSIZE * sizeof(u32)));
+    // Batched recovery writes up to MAXSOLS proofs (one per candidate cycle).
+    checkCudaErrors_V(cudaMalloc((void **)&recoverIndexes, (size_t)MAXSOLS * PROOFSIZE * sizeof(u32)));
 #endif
     mutatenonce = mutate_nonce;
   }
