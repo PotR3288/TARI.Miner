@@ -41,6 +41,8 @@ public:
   u32 MAXSOLS;
   proof *sols;
   u32 nsols;
+  // [tari-c29] DFS-trigger accounting for walk-cost profiling (TARI_C29_WALK_TIMING)
+  u64 dfs_triggers = 0;
 
   graph(word_t maxedges, word_t maxnodes, u32 maxsols) : visited(2*maxnodes) {
     MAXEDGES = maxedges;
@@ -139,6 +141,9 @@ public:
 
   void resetcounts() {
     nlinks = nsols = 0;
+    dfs_triggers = 0; // [tari-c29] profiling
+    if (compressu) compressu->probes = 0;
+    if (compressv) compressv->probes = 0;
     // visited has entries set only during cycles() call
   }
 
@@ -217,8 +222,10 @@ public:
 #if GRAPH_UNION_SKIP
     bool maybeCycle = ufparent[u] != NIL && ufparent[v] != NIL && uf_find(u) == uf_find(v);
     if (maybeCycle) {
+      ++dfs_triggers; // [tari-c29] profiling
 #else
     if (adjlist[u] != NIL && adjlist[v] != NIL) { // possibly part of a cycle
+      ++dfs_triggers; // [tari-c29] profiling
 #endif
       sols[nsols][0] = nlinks/2;
       assert(!visited.test(u));

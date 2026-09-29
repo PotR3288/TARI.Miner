@@ -1101,7 +1101,9 @@ struct solver_ctx {
     if (!cg.nsols) {
       if (walk_timing && nedges > 100000) { // only log non-trivial graphs
         t_walk1 = timestamp();
-        fprintf(stderr, "host-walk edges %d nsols 0 time %.2f ms\n", nedges, (t_walk1 - t_walk0) / 1e6);
+        fprintf(stderr, "host-walk edges %d nsols 0 time %.2f ms probes %.3fM dfs %u\n",
+                nedges, (t_walk1 - t_walk0) / 1e6,
+                (cg.compressu->probes + cg.compressv->probes) / 1e6, (unsigned)cg.dfs_triggers);
       }
       return 0;
     }
@@ -1182,8 +1184,9 @@ struct solver_ctx {
     delete[] noncesHost;
     if (walk_timing) {
       u64 t_end = timestamp();
-      fprintf(stderr, "host-walk edges %d nsols %u time %.2f ms recovery %.2f ms\n",
-              nedges, cg.nsols, (t_walk1 - t_walk0) / 1e6, (t_end - t_walk1) / 1e6);
+      fprintf(stderr, "host-walk edges %d nsols %u time %.2f ms recovery %.2f ms probes %.3fM dfs %u\n",
+              nedges, cg.nsols, (t_walk1 - t_walk0) / 1e6, (t_end - t_walk1) / 1e6,
+              (cg.compressu->probes + cg.compressv->probes) / 1e6, (unsigned)cg.dfs_triggers);
     }
     return 0;
   }

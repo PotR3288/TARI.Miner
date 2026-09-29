@@ -19,6 +19,8 @@ public:
   const word_t NIL = ~(word_t)0;
   word_t *nodes;
   bool sharedmem;
+  // [tari-c29] probe accounting for walk-cost profiling (TARI_C29_WALK_TIMING)
+  u64 probes = 0;
 
   compressor(u32 nodebits, u32 compressbits, char *bytes) {
     NODEBITS = nodebits;
@@ -61,6 +63,7 @@ public:
   word_t compress(word_t u) {
     word_t ui = u >> SHIFTBITS;
     for (; ; ui = (ui+1) & MASK2) {
+      ++probes; // [tari-c29] profiling
       word_t cu = nodes[ui];
       if (cu == NIL) {
         if (nnodes >= SIZE) {
