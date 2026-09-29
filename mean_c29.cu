@@ -12,6 +12,8 @@
 #include "graph.hpp"
 #include "../crypto/siphash.cuh"
 #include "../crypto/blake2.h"
+// [tari-c29] GPU endpoint compression for the host walk (Phase 3)
+#include <cub/cub.cuh>
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -1203,6 +1205,8 @@ struct solver_ctx {
   int solve() {
     u64 time0, time1;
     u32 timems,timems2;
+    // [tari-c29] per-graph trim vs findcycles breakdown (TARI_C29_WALK_TIMING)
+    static const bool solve_timing = getenv("TARI_C29_WALK_TIMING") != nullptr;
 
     time0 = timestamp();
     u32 nedges = trim_copy();
@@ -1214,6 +1218,9 @@ struct solver_ctx {
       return 0;
     time1 = timestamp(); timems2 = (time1 - time0) / 1000000;
     print_log("findcycles edges %d time %d ms total %d ms\n", nedges, timems2, timems+timems2);
+    if (solve_timing)
+      fprintf(stderr, "solve edges %u trim %.1f ms findcycles %.1f ms\n",
+              nedges, (double)timems, (double)timems2);
     return sols.size() / PROOFSIZE;
   }
 
