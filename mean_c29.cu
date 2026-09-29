@@ -1090,11 +1090,22 @@ struct solver_ctx {
   }
 
   int findcycles_with_keys(uint2 *edges, u32 nedges, const siphash_keys &keys, std::vector<u32> &outSols) {
+    // [tari-c29] Host-walk timing: TARI_C29_WALK_TIMING=1 logs per-attempt
+    // graph-construction cost (the candidate for on-GPU cycle-finding).
+    static const bool walk_timing = getenv("TARI_C29_WALK_TIMING") != nullptr;
+    u64 t_walk0 = 0, t_walk1 = 0;
+    if (walk_timing) t_walk0 = timestamp();
     cg.reset();
     for (u32 i = 0; i < nedges; i++)
       cg.add_compress_edge(edges[i].x, edges[i].y);
-    if (!cg.nsols)
+    if (!cg.nsols) {
+      if (walk_timing && nedges > 100000) { // only log non-trivial graphs
+        t_walk1 = timestamp();
+        print_log("host-walk edges %d nsols 0 time %.2f ms\n", nedges, (t_walk1 - t_walk0) / 1e6);
+      }
       return 0;
+    }
+    if (walk_timing) t_walk1 = timestamp(); // host walk done; recovery phase starts here
 
     // [tari-c29] Batched recovery: collect every candidate cycle first, then
     // resolve all of their nonces in a single full-graph scan. The old code
@@ -1169,6 +1180,11 @@ struct solver_ctx {
       qsort(&outSols[solbase], PROOFSIZE, sizeof(u32), cg.nonce_cmp);
     }
     delete[] noncesHost;
+    if (walk_timing) {
+      u64 t_end = timestamp();
+      print_log("host-walk edges %d nsols %u time %.2f ms recovery %.2f ms\n",
+                nedges, cg.nsols, (t_walk1 - t_walk0) / 1e6, (t_end - t_walk1) / 1e6);
+    }
     return 0;
   }
 
