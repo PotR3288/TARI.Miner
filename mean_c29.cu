@@ -1067,10 +1067,12 @@ __global__ void make_flags(const u32 *sorted, u32 *flags, int n) {
   if (i < n) flags[i] = (i == 0 || sorted[i] != sorted[i-1]) ? 1u : 0u;
 }
 
-// comp[perm_out[i]] = rank_at_pos[i]: scatter dense ranks back to original edge order.
-__global__ void scatter_ranks(const u32 *perm_out, const u32 *rank_at_pos, u32 *comp, int n) {
+// comp[2*i + which] = rank_at_pos[i]: scatter dense ranks back to original edge
+// order in an INTERLEAVED {x_id, y_id} layout so one nedges*sizeof(uint2) DtoH
+// copy carries both partitions.
+__global__ void scatter_ranks(const u32 *perm_out, const u32 *rank_at_pos, u32 *comp, int which, int n) {
   int i = blockIdx.x*blockDim.x + threadIdx.x;
-  if (i < n) comp[perm_out[i]] = rank_at_pos[i];
+  if (i < n) comp[2*i + which] = rank_at_pos[i];
 }
 
 struct SolverTrimResult {
@@ -1090,8 +1092,8 @@ struct solver_ctx {
 #endif
 
   // [tari-c29] Phase 3: on-GPU endpoint->ID compression scratch. Allocated only
-  // when TARI_C29_GPU_COMPRESS=1 (default off). d_comp layout: [0..MAXEDGES) =
-  // dense injective IDs for edge.x, [MAXEDGES..2*MAXEDGES) = IDs for edge.y.
+  // when TARI_C29_GPU_COMPRESS=1 (default off). d_comp is INTERLEAVED:
+  // d_comp[2*i] = dense injective ID for edge[i].x, d_comp[2*i+1] = ID for .y.
   bool gpu_compression = false;
   u32 *d_side_vals = nullptr, *d_sorted = nullptr, *d_perm = nullptr, *d_perm_out = nullptr, *d_rank = nullptr;
   u32 *d_comp = nullptr;
@@ -1143,16 +1145,16 @@ struct solver_ctx {
     return true;
   }
 
-  // Fills h_comp_pinned with dense injective endpoint IDs for both sides.
-  // Returns false (caller falls back to the host compression path) when the
-  // feature is off, the graph is too small to be worth it, or any CUDA/CUB step fails.
+  // Fills h_comp_pinned with dense injective endpoint IDs in INTERLEAVED
+  // {x_id, y_id} order (one uint2 per edge). Returns false (caller falls back to
+  // the host compression path) when the feature is off, the graph is too small
+  // to be worth it, or any CUDA/CUB step fails.
   bool gpu_compress(const uint2 *edges, u32 nedges) {
     if (!gpu_compression || nedges < GPU_COMPRESS_MIN_EDGES)
       return false;
     const int blocks = (nedges + 255) / 256;
     cudaError_t rc;
     for (int which = 0; which < 2; which++) {
-      u32 *comp_dst = d_comp + (which ? MAXEDGES : 0);
       split_edge_side<<<blocks, 256>>>(edges, d_side_vals, which, nedges);
       init_perm<<<blocks, 256>>>(d_perm, nedges);
       rc = cub::DeviceRadixSort::SortPairs<u32,u32,int>(d_cub_temp, cub_sort_bytes,
@@ -1162,7 +1164,7 @@ struct solver_ctx {
       make_flags<<<blocks, 256>>>(d_sorted, d_rank, nedges);
       rc = cub::DeviceScan::ExclusiveSum<u32*,u32*>(d_scan_temp, scan_bytes, d_rank, d_rank, nedges);
       if (rc != cudaSuccess) return false;
-      scatter_ranks<<<blocks, 256>>>(d_perm_out, d_rank, comp_dst, nedges);
+      scatter_ranks<<<blocks, 256>>>(d_perm_out, d_rank, d_comp, which, nedges);
     }
     rc = cudaMemcpy(h_comp_pinned, d_comp, (size_t)nedges * sizeof(uint2), cudaMemcpyDeviceToHost);
     if (rc != cudaSuccess) return false;
@@ -1237,10 +1239,10 @@ struct solver_ctx {
     // pre-computed dense injective IDs — no per-edge hash lookups (the measured
     // ~4.6M-probe / ~250 ms cost). Falls back to the legacy path on any failure.
     bool gpu_ids = gpu_compress(edges, nedges);
-    cg.reset(!gpu_ids); // skip the two 8MB compressor-table resets when unused
+    cg.reset(gpu_ids); // skip the two 8MB compressor-table resets only on the GPU-ID path (they are unused there)
     if (gpu_ids) {
       for (u32 i = 0; i < nedges; i++)
-        cg.add_edge(h_comp_pinned[i], h_comp_pinned[MAXEDGES + i]);
+        cg.add_edge(h_comp_pinned[2*i], h_comp_pinned[2*i + 1]); // interleaved {x_id, y_id}
     } else {
       for (u32 i = 0; i < nedges; i++)
         cg.add_compress_edge(edges[i].x, edges[i].y);
