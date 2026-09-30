@@ -1061,18 +1061,23 @@ __global__ void init_perm(u32 *perm, int n) {
   if (i < n) perm[i] = (u32)i;
 }
 
-// flag[i] = 1 iff sorted[i] starts a new distinct value (first or differs from prev)
+// rank_at_pos[i] = INCLUSIVE prefix sum of flags at i (>= 1): the 1-based group
+// index of sorted position i. All positions in one equal-value group share it;
+// distinct groups get distinct consecutive values. scatter_ranks subtracts 1 to
+// produce dense 0-based injective IDs.
 __global__ void make_flags(const u32 *sorted, u32 *flags, int n) {
   int i = blockIdx.x*blockDim.x + threadIdx.x;
   if (i < n) flags[i] = (i == 0 || sorted[i] != sorted[i-1]) ? 1u : 0u;
 }
 
 // For each SORTED position i, perm_out[i] is the original edge index that value
-// came from; scatter its dense rank there. Result: comp[2*k+which] = injective ID
-// of edges[k]'s endpoint (equal values -> equal IDs, distinct values -> distinct).
+// came from. rank_at_pos[i] is its 1-based INCLUSIVE group index (all positions
+// of one equal-value group share it); subtracting 1 yields a dense 0-based ID.
+// Result: comp[2*k+which] = injective ID of edges[k]'s endpoint — equal values
+// -> equal IDs, distinct values -> distinct consecutive IDs in [0, ndistinct).
 __global__ void scatter_ranks(const u32 *perm_out, const u32 *rank_at_pos, u32 *comp, int which, int n) {
   int i = blockIdx.x*blockDim.x + threadIdx.x;
-  if (i < n) comp[2*(size_t)perm_out[i] + which] = rank_at_pos[i];
+  if (i < n) comp[2*(size_t)perm_out[i] + which] = rank_at_pos[i] - 1u;
 }
 
 struct SolverTrimResult {
@@ -1173,7 +1178,7 @@ struct solver_ctx {
                                                         nedges, 0, 32);
       if (rc != cudaSuccess) return fail_diag("sort", rc);
       make_flags<<<blocks, 256>>>(d_sorted, d_rank, nedges);
-      rc = cub::DeviceScan::ExclusiveSum<u32*,u32*>(d_scan_temp, scan_bytes, d_rank, d_rank, nedges);
+      rc = cub::DeviceScan::InclusiveSum<u32*,u32*>(d_scan_temp, scan_bytes, d_rank, d_rank, nedges);
       if (rc != cudaSuccess) return fail_diag("scan", rc);
       scatter_ranks<<<blocks, 256>>>(d_perm_out, d_rank, d_comp, which, nedges);
     }
