@@ -12,8 +12,13 @@
 #include "graph.hpp"
 #include "../crypto/siphash.cuh"
 #include "../crypto/blake2.h"
-// [tari-c29] GPU endpoint compression for the host walk (Phase 3)
+// [tari-c29] Phase 3: on-GPU endpoint->ID compression (opt-in TARI_C29_GPU_COMPRESS=1).
+// CUDA 13 ships CUB under CCCL; keep the classic include for older toolchains.
+#if __CUDACC_VER_MAJOR__ >= 13
+#include <cccl/cub/cub.cuh>
+#else
 #include <cub/cub.cuh>
+#endif
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -1036,6 +1041,38 @@ struct edgetrimmer {
   }
 };
 
+// [tari-c29] Phase 3: on-GPU endpoint->ID compression. The host walk's cost is
+// dominated by sequential linear-probing hash compression (measured ~4.6M probes,
+// ~250 ms/attempt), NOT cycle-finding (DFS triggers only a few times per attempt).
+// Node IDs are pure labels: cycles_with_link uses only adjacency structure, recovery
+// stores edge indices (not node IDs), and verify() re-derives every proof via SipHash.
+// So any consistent endpoint->ID relabeling is safe; an INJECTIVE one is strictly
+// safer than the lossy host compressor (~18% false merges). Per partition, distinct
+// endpoints <= nedges <= MAXEDGES == MAXNODES, so dense injective IDs always fit.
+#define GPU_COMPRESS_MIN_EDGES 50000
+
+__global__ void split_edge_side(const uint2 *edges, u32 *vals, int which, int n) {
+  int i = blockIdx.x*blockDim.x + threadIdx.x;
+  if (i < n) vals[i] = which ? edges[i].y : edges[i].x;
+}
+
+__global__ void init_perm(u32 *perm, int n) {
+  int i = blockIdx.x*blockDim.x + threadIdx.x;
+  if (i < n) perm[i] = (u32)i;
+}
+
+// flag[i] = 1 iff sorted[i] starts a new distinct value (first or differs from prev)
+__global__ void make_flags(const u32 *sorted, u32 *flags, int n) {
+  int i = blockIdx.x*blockDim.x + threadIdx.x;
+  if (i < n) flags[i] = (i == 0 || sorted[i] != sorted[i-1]) ? 1u : 0u;
+}
+
+// comp[perm_out[i]] = rank_at_pos[i]: scatter dense ranks back to original edge order.
+__global__ void scatter_ranks(const u32 *perm_out, const u32 *rank_at_pos, u32 *comp, int n) {
+  int i = blockIdx.x*blockDim.x + threadIdx.x;
+  if (i < n) comp[perm_out[i]] = rank_at_pos[i];
+}
+
 struct SolverTrimResult {
   u32 nedges = 0;
   cudaError_t cuda_error = cudaSuccess;
@@ -1051,6 +1088,86 @@ struct solver_ctx {
 #if RECOVERY_SMALL_OUTPUT
   u32 *recoverIndexes;
 #endif
+
+  // [tari-c29] Phase 3: on-GPU endpoint->ID compression scratch. Allocated only
+  // when TARI_C29_GPU_COMPRESS=1 (default off). d_comp layout: [0..MAXEDGES) =
+  // dense injective IDs for edge.x, [MAXEDGES..2*MAXEDGES) = IDs for edge.y.
+  bool gpu_compression = false;
+  u32 *d_side_vals = nullptr, *d_sorted = nullptr, *d_perm = nullptr, *d_perm_out = nullptr, *d_rank = nullptr;
+  u32 *d_comp = nullptr;
+  void *d_cub_temp = nullptr; size_t cub_sort_bytes = 0;
+  void *d_scan_temp = nullptr; size_t scan_bytes = 0;
+  u32 *h_comp_pinned = nullptr;
+
+  bool gpu_compress_init() {
+    if (getenv("TARI_C29_GPU_COMPRESS") == nullptr)
+      return false; // default off: legacy host compression path
+    const size_t b = (size_t)MAXEDGES * sizeof(u32);
+    cudaError_t rc;
+    rc  = cudaMalloc((void**)&d_side_vals, b);
+    if (!rc) rc = cudaMalloc((void**)&d_sorted, b);
+    if (!rc) rc = cudaMalloc((void**)&d_perm, b);
+    if (!rc) rc = cudaMalloc((void**)&d_perm_out, b);
+    if (!rc) rc = cudaMalloc((void**)&d_rank, b);
+    if (!rc) rc = cudaMalloc((void**)&d_comp, 2 * b);
+    // size CUB temp storage once at the worst case (n = MAXEDGES), then reuse
+    if (!rc) {
+      cub::DeviceRadixSort::SortPairs<u32,u32,int>(nullptr, cub_sort_bytes,
+                                                   d_side_vals, d_sorted, d_perm, d_perm_out,
+                                                   MAXEDGES, 0, 32);
+      rc = cudaMalloc(&d_cub_temp, cub_sort_bytes);
+    }
+    if (!rc) {
+      size_t sb = 0;
+      cub::DeviceScan::ExclusiveSum<u32*,u32*>(nullptr, sb, d_rank, d_rank, MAXEDGES);
+      rc = cudaMalloc(&d_scan_temp, sb);
+      scan_bytes = sb;
+    }
+    if (!rc)
+      rc = cudaMallocHost((void**)&h_comp_pinned, 2 * b);
+    if (rc != cudaSuccess) {
+      // partial-init cleanup: free whatever was allocated so far
+      gpu_compression = false;
+      cudaFree(d_side_vals); d_side_vals = nullptr;
+      cudaFree(d_sorted); d_sorted = nullptr;
+      cudaFree(d_perm); d_perm = nullptr;
+      cudaFree(d_perm_out); d_perm_out = nullptr;
+      cudaFree(d_rank); d_rank = nullptr;
+      cudaFree(d_comp); d_comp = nullptr;
+      cudaFree(d_cub_temp); d_cub_temp = nullptr;
+      cudaFree(d_scan_temp); d_scan_temp = nullptr;
+      if (h_comp_pinned) { cudaFreeHost(h_comp_pinned); h_comp_pinned = nullptr; }
+      return false;
+    }
+    gpu_compression = true;
+    return true;
+  }
+
+  // Fills h_comp_pinned with dense injective endpoint IDs for both sides.
+  // Returns false (caller falls back to the host compression path) when the
+  // feature is off, the graph is too small to be worth it, or any CUDA/CUB step fails.
+  bool gpu_compress(const uint2 *edges, u32 nedges) {
+    if (!gpu_compression || nedges < GPU_COMPRESS_MIN_EDGES)
+      return false;
+    const int blocks = (nedges + 255) / 256;
+    cudaError_t rc;
+    for (int which = 0; which < 2; which++) {
+      u32 *comp_dst = d_comp + (which ? MAXEDGES : 0);
+      split_edge_side<<<blocks, 256>>>(edges, d_side_vals, which, nedges);
+      init_perm<<<blocks, 256>>>(d_perm, nedges);
+      rc = cub::DeviceRadixSort::SortPairs<u32,u32,int>(d_cub_temp, cub_sort_bytes,
+                                                        d_side_vals, d_sorted, d_perm, d_perm_out,
+                                                        nedges, 0, 32);
+      if (rc != cudaSuccess) return false;
+      make_flags<<<blocks, 256>>>(d_sorted, d_rank, nedges);
+      rc = cub::DeviceScan::ExclusiveSum<u32*,u32*>(d_scan_temp, scan_bytes, d_rank, d_rank, nedges);
+      if (rc != cudaSuccess) return false;
+      scatter_ranks<<<blocks, 256>>>(d_perm_out, d_rank, comp_dst, nedges);
+    }
+    rc = cudaMemcpy(h_comp_pinned, d_comp, (size_t)nedges * sizeof(uint2), cudaMemcpyDeviceToHost);
+    if (rc != cudaSuccess) return false;
+    return true;
+  }
 
   solver_ctx(const trimparams tp, bool mutate_nonce) : trimmer(tp), cg(MAXEDGES, MAXEDGES, MAXSOLS, IDXSHIFT) {
     pinned_edges = false;
@@ -1072,6 +1189,7 @@ struct solver_ctx {
     // Batched recovery writes up to MAXSOLS proofs (one per candidate cycle).
     checkCudaErrors_V(cudaMalloc((void **)&recoverIndexes, (size_t)MAXSOLS * PROOFSIZE * sizeof(u32)));
 #endif
+    gpu_compress_init(); // [tari-c29] Phase 3; no-op unless TARI_C29_GPU_COMPRESS=1
     mutatenonce = mutate_nonce;
   }
 
@@ -1085,6 +1203,18 @@ struct solver_ctx {
 #if RECOVERY_SMALL_OUTPUT
     cudaFree(recoverIndexes);
 #endif
+    if (gpu_compression) { // [tari-c29] Phase 3 scratch
+      cudaFree(d_side_vals);
+      cudaFree(d_sorted);
+      cudaFree(d_perm);
+      cudaFree(d_perm_out);
+      cudaFree(d_rank);
+      cudaFree(d_comp);
+      cudaFree(d_cub_temp);
+      cudaFree(d_scan_temp);
+      if (h_comp_pinned)
+        cudaFreeHost(h_comp_pinned);
+    }
     if (pinned_edges)
       cudaFreeHost(edges);
     else
@@ -1102,9 +1232,19 @@ struct solver_ctx {
     static const bool walk_timing = getenv("TARI_C29_WALK_TIMING") != nullptr;
     u64 t_walk0 = 0, t_walk1 = 0;
     if (walk_timing) t_walk0 = timestamp();
-    cg.reset();
-    for (u32 i = 0; i < nedges; i++)
-      cg.add_compress_edge(edges[i].x, edges[i].y);
+    // [tari-c29] Phase 3: on-GPU endpoint->ID compression. When enabled and it
+    // succeeds, the host walk becomes a plain O(nedges) adjacency build with
+    // pre-computed dense injective IDs — no per-edge hash lookups (the measured
+    // ~4.6M-probe / ~250 ms cost). Falls back to the legacy path on any failure.
+    bool gpu_ids = gpu_compress(edges, nedges);
+    cg.reset(!gpu_ids); // skip the two 8MB compressor-table resets when unused
+    if (gpu_ids) {
+      for (u32 i = 0; i < nedges; i++)
+        cg.add_edge(h_comp_pinned[i], h_comp_pinned[MAXEDGES + i]);
+    } else {
+      for (u32 i = 0; i < nedges; i++)
+        cg.add_compress_edge(edges[i].x, edges[i].y);
+    }
     if (!cg.nsols) {
       if (walk_timing && nedges > 100000) { // only log non-trivial graphs
         t_walk1 = timestamp();

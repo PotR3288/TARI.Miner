@@ -127,12 +127,12 @@ public:
     return (sizeof(word_t)*(size_t)(2*MAXNODES)) + (sizeof(link)*(size_t)(2*MAXEDGES)) + (compressu ? 2 * compressu->bytes() : 0);
   }
 
-  void reset() {
+  void reset(bool skip_compress = false) {
     memset(adjlist, (char)NIL, (sizeof(word_t)*(size_t)(2*MAXNODES)));
 #if GRAPH_UNION_SKIP
     memset(ufparent, (char)NIL, (sizeof(word_t)*(size_t)(2*MAXNODES)));
 #endif
-    if (compressu) {
+    if (compressu && !skip_compress) { // [tari-c29] fast-walk path skips the two 8MB table resets
       compressu->reset();
       compressv->reset();
     }
