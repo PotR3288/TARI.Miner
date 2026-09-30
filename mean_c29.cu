@@ -1130,6 +1130,8 @@ struct solver_ctx {
     if (rc != cudaSuccess) {
       // partial-init cleanup: free whatever was allocated so far
       gpu_compression = false;
+      if (getenv("TARI_C29_WALK_TIMING"))
+        fprintf(stderr, "gpu-compress INIT FAIL rc=%d (%s)\n", (int)rc, cudaGetErrorString(rc));
       cudaFree(d_side_vals); d_side_vals = nullptr;
       cudaFree(d_sorted); d_sorted = nullptr;
       cudaFree(d_perm); d_perm = nullptr;
@@ -1154,20 +1156,29 @@ struct solver_ctx {
       return false;
     const int blocks = (nedges + 255) / 256;
     cudaError_t rc;
+    // [tari-c29] one-shot diagnostics: report which step fails on the first failure
+    static bool diag_done = false;
+    auto fail_diag = [&](const char *step, cudaError_t err) {
+      if (!diag_done && getenv("TARI_C29_WALK_TIMING")) {
+        diag_done = true;
+        fprintf(stderr, "gpu-compress FAIL at %s rc=%d (%s)\n", step, (int)err, cudaGetErrorString(err));
+      }
+      return false;
+    };
     for (int which = 0; which < 2; which++) {
       split_edge_side<<<blocks, 256>>>(edges, d_side_vals, which, nedges);
       init_perm<<<blocks, 256>>>(d_perm, nedges);
       rc = cub::DeviceRadixSort::SortPairs<u32,u32,int>(d_cub_temp, cub_sort_bytes,
                                                         d_side_vals, d_sorted, d_perm, d_perm_out,
                                                         nedges, 0, 32);
-      if (rc != cudaSuccess) return false;
+      if (rc != cudaSuccess) return fail_diag("sort", rc);
       make_flags<<<blocks, 256>>>(d_sorted, d_rank, nedges);
       rc = cub::DeviceScan::ExclusiveSum<u32*,u32*>(d_scan_temp, scan_bytes, d_rank, d_rank, nedges);
-      if (rc != cudaSuccess) return false;
+      if (rc != cudaSuccess) return fail_diag("scan", rc);
       scatter_ranks<<<blocks, 256>>>(d_perm_out, d_rank, d_comp, which, nedges);
     }
     rc = cudaMemcpy(h_comp_pinned, d_comp, (size_t)nedges * sizeof(uint2), cudaMemcpyDeviceToHost);
-    if (rc != cudaSuccess) return false;
+    if (rc != cudaSuccess) return fail_diag("dtoh", rc);
     return true;
   }
 
