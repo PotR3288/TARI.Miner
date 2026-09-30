@@ -1067,12 +1067,12 @@ __global__ void make_flags(const u32 *sorted, u32 *flags, int n) {
   if (i < n) flags[i] = (i == 0 || sorted[i] != sorted[i-1]) ? 1u : 0u;
 }
 
-// comp[2*i + which] = rank_at_pos[i]: scatter dense ranks back to original edge
-// order in an INTERLEAVED {x_id, y_id} layout so one nedges*sizeof(uint2) DtoH
-// copy carries both partitions.
+// For each SORTED position i, perm_out[i] is the original edge index that value
+// came from; scatter its dense rank there. Result: comp[2*k+which] = injective ID
+// of edges[k]'s endpoint (equal values -> equal IDs, distinct values -> distinct).
 __global__ void scatter_ranks(const u32 *perm_out, const u32 *rank_at_pos, u32 *comp, int which, int n) {
   int i = blockIdx.x*blockDim.x + threadIdx.x;
-  if (i < n) comp[2*i + which] = rank_at_pos[i];
+  if (i < n) comp[2*(size_t)perm_out[i] + which] = rank_at_pos[i];
 }
 
 struct SolverTrimResult {
